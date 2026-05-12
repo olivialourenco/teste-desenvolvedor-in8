@@ -1,0 +1,10 @@
+# Node.js
+node_modules/
+npm-debug.log
+
+# Golang
+*.exe
+parte-2-review/parte-2-review.exe
+
+# Outros
+.DS_Store

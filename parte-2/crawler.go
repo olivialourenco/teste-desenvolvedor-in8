@@ -44,6 +44,7 @@ func (e *HTTPStatusError) Error() string {
 	return fmt.Sprintf("status %d for %s", e.StatusCode, e.URL)
 }
 
+// NewCrawler configura o cliente HTTP e as opções de retry e estado usadas pelo crawler.
 func NewCrawler(outputFile, stateFile string) *Crawler {
 	return &Crawler{
 		client: &http.Client{
@@ -57,6 +58,7 @@ func NewCrawler(outputFile, stateFile string) *Crawler {
 	}
 }
 
+// fetchPage realiza a requisição e parse do HTML, validando o status da resposta.
 func (c *Crawler) fetchPage(ctx context.Context, fullURL string) (*html.Node, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, fullURL, nil)
 	if err != nil {
@@ -81,6 +83,7 @@ func (c *Crawler) fetchPage(ctx context.Context, fullURL string) (*html.Node, er
 	return doc, nil
 }
 
+// fetchPageWithRetry aplica tentativas com backoff exponencial para falhas temporárias.
 func (c *Crawler) fetchPageWithRetry(ctx context.Context, fullURL string) (*html.Node, error) {
 	var lastErr error
 	backoff := c.initialBackoff
@@ -129,6 +132,7 @@ func isRetryable(err error) bool {
 	return false
 }
 
+// loadBooks recupera a lista de livros já gravada para permitir retomar a coleta.
 func (c *Crawler) loadBooks() ([]Book, error) {
 	data, err := os.ReadFile(c.outputFile)
 	if err != nil {
@@ -161,14 +165,17 @@ func (c *Crawler) saveJSON(filename string, v interface{}) error {
 	return os.Rename(tmp, filename)
 }
 
+// saveState persiste o progresso atual do crawler para retomar no próximo ciclo.
 func (c *Crawler) saveState(state crawlState) error {
 	return c.saveJSON(c.stateFile, state)
 }
 
+// saveBooks atualiza o arquivo de saída com os livros coletados até o momento.
 func (c *Crawler) saveBooks(books []Book) error {
 	return c.saveJSON(c.outputFile, books)
 }
 
+// loadState carrega o estado do processo para retomar a coleta de onde parou.
 func (c *Crawler) loadState() (crawlState, error) {
 	var state crawlState
 	data, err := os.ReadFile(c.stateFile)
@@ -184,6 +191,7 @@ func (c *Crawler) loadState() (crawlState, error) {
 	return state, nil
 }
 
+// clearState remove o arquivo de estado quando a coleta é concluída com sucesso.
 func (c *Crawler) clearState() error {
 	if err := os.Remove(c.stateFile); err != nil && !os.IsNotExist(err) {
 		return err
@@ -191,6 +199,7 @@ func (c *Crawler) clearState() error {
 	return nil
 }
 
+// Crawl coordena o loop de coleta, salva progresso e respeita intervalos entre páginas.
 func (c *Crawler) Crawl(ctx context.Context, startURL string) ([]Book, error) {
 	books, err := c.loadBooks()
 	if err != nil {
@@ -252,6 +261,7 @@ func (c *Crawler) Crawl(ctx context.Context, startURL string) ([]Book, error) {
 	return books, nil
 }
 
+// parseBooks extrai a lista de livros a partir da árvore HTML parseada.
 func parseBooks(doc *html.Node) []Book {
 	var books []Book
 	var walk func(*html.Node)
@@ -267,6 +277,7 @@ func parseBooks(doc *html.Node) []Book {
 	return books
 }
 
+// extractBook coleta título, preço e avaliação de um bloco individual de livro.
 func extractBook(n *html.Node) Book {
 	var title, price, rating string
 	var walk func(*html.Node)
