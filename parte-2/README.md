@@ -1,6 +1,6 @@
 # Parte 2 - Revisão de código
 
-Esta projeto consistiu na análise técnica, identificação de falhas e refatoração de um crawler desenvolvido em Golang para o site `books.toscrape.com`.
+Este projeto consistiu na análise técnica, identificação de falhas e refatoração de um crawler desenvolvido em Golang para o site `books.toscrape.com`.
 
 ## Como Rodar o Projeto
 
