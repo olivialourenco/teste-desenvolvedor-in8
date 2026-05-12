@@ -12,8 +12,8 @@ Este repositório contém duas entregas relacionadas a crawlers:
 
 ## Links de Acesso Rápido
 
-- [parte-1-crawler/README.md](./parte-1/README.md)
-- [parte-2-review/README.md](./parte-2/README.md)
+- [parte-1/README.md](./parte-1/README.md)
+- [parte-2/README.md](./parte-2/README.md)
 
 ## Tecnologias Utilizadas
 
