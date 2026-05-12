@@ -16,12 +16,14 @@ import (
 	"golang.org/x/net/html"
 )
 
+// Book define a estrutura de dados para o mapeamento do JSON de saída.
 type Book struct {
 	Title  string `json:"title"`
 	Price  string `json:"price"`
 	Rating string `json:"rating"`
 }
 
+// Crawler centraliza as configurações de rede, políticas de repetição e persistência de estado.
 type Crawler struct {
 	client         *http.Client
 	maxRetries     int
@@ -31,10 +33,12 @@ type Crawler struct {
 	stateFile      string
 }
 
+// crawlState armazena a última URL processada para permitir a retomada após interrupções.
 type crawlState struct {
 	NextPage string `json:"next_page"`
 }
 
+// HTTPStatusError captura erros específicos de status HTTP para facilitar a lógica de retentativa.
 type HTTPStatusError struct {
 	URL        string
 	StatusCode int
@@ -44,11 +48,11 @@ func (e *HTTPStatusError) Error() string {
 	return fmt.Sprintf("status %d for %s", e.StatusCode, e.URL)
 }
 
-// NewCrawler configura o cliente HTTP e as opções de retry e estado usadas pelo crawler.
+// NewCrawler configura o cliente HTTP com timeouts de segurança e define o User-Agent para evitar bloqueios.
 func NewCrawler(outputFile, stateFile string) *Crawler {
 	return &Crawler{
 		client: &http.Client{
-			Timeout: 20 * time.Second,
+			Timeout: 20 * time.Second, // Timeout global para evitar conexões penduradas.
 		},
 		maxRetries:     3,
 		initialBackoff: 500 * time.Millisecond,
@@ -58,7 +62,7 @@ func NewCrawler(outputFile, stateFile string) *Crawler {
 	}
 }
 
-// fetchPage realiza a requisição e parse do HTML, validando o status da resposta.
+// fetchPage executa a chamada HTTP e realiza o parse do corpo da resposta para uma árvore HTML.
 func (c *Crawler) fetchPage(ctx context.Context, fullURL string) (*html.Node, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, fullURL, nil)
 	if err != nil {
@@ -83,7 +87,7 @@ func (c *Crawler) fetchPage(ctx context.Context, fullURL string) (*html.Node, er
 	return doc, nil
 }
 
-// fetchPageWithRetry aplica tentativas com backoff exponencial para falhas temporárias.
+// fetchPageWithRetry gerencia falhas temporárias aplicando backoff exponencial entre as tentativas.
 func (c *Crawler) fetchPageWithRetry(ctx context.Context, fullURL string) (*html.Node, error) {
 	var lastErr error
 	backoff := c.initialBackoff
@@ -95,7 +99,7 @@ func (c *Crawler) fetchPageWithRetry(ctx context.Context, fullURL string) (*html
 				return nil, ctx.Err()
 			case <-time.After(backoff):
 			}
-			backoff *= 2
+			backoff *= 2 // Aumenta o tempo de espera a cada falha seguida.
 		}
 
 		doc, err := c.fetchPage(ctx, fullURL)
@@ -104,7 +108,7 @@ func (c *Crawler) fetchPageWithRetry(ctx context.Context, fullURL string) (*html
 		}
 
 		lastErr = err
-		if !isRetryable(err) {
+		if !isRetryable(err) { // Interrompe se o erro for definitivo (ex: 404).
 			return nil, err
 		}
 
@@ -114,6 +118,7 @@ func (c *Crawler) fetchPageWithRetry(ctx context.Context, fullURL string) (*html
 	return nil, fmt.Errorf("não foi possível buscar %s após %d tentativas: %w", fullURL, c.maxRetries+1, lastErr)
 }
 
+// isRetryable identifica erros de rede ou status 429/5xx que justificam uma nova tentativa.
 func isRetryable(err error) bool {
 	var httpErr *HTTPStatusError
 	if errors.As(err, &httpErr) {
@@ -132,7 +137,7 @@ func isRetryable(err error) bool {
 	return false
 }
 
-// loadBooks recupera a lista de livros já gravada para permitir retomar a coleta.
+// loadBooks carrega dados existentes do disco para garantir a continuidade da lista de resultados.
 func (c *Crawler) loadBooks() ([]Book, error) {
 	data, err := os.ReadFile(c.outputFile)
 	if err != nil {
@@ -149,6 +154,7 @@ func (c *Crawler) loadBooks() ([]Book, error) {
 	return books, nil
 }
 
+// saveJSON realiza a escrita atômica utilizando um arquivo temporário para evitar corrupção de dados.
 func (c *Crawler) saveJSON(filename string, v interface{}) error {
 	data, err := json.MarshalIndent(v, "", "  ")
 	if err != nil {
@@ -165,17 +171,14 @@ func (c *Crawler) saveJSON(filename string, v interface{}) error {
 	return os.Rename(tmp, filename)
 }
 
-// saveState persiste o progresso atual do crawler para retomar no próximo ciclo.
 func (c *Crawler) saveState(state crawlState) error {
 	return c.saveJSON(c.stateFile, state)
 }
 
-// saveBooks atualiza o arquivo de saída com os livros coletados até o momento.
 func (c *Crawler) saveBooks(books []Book) error {
 	return c.saveJSON(c.outputFile, books)
 }
 
-// loadState carrega o estado do processo para retomar a coleta de onde parou.
 func (c *Crawler) loadState() (crawlState, error) {
 	var state crawlState
 	data, err := os.ReadFile(c.stateFile)
@@ -191,7 +194,6 @@ func (c *Crawler) loadState() (crawlState, error) {
 	return state, nil
 }
 
-// clearState remove o arquivo de estado quando a coleta é concluída com sucesso.
 func (c *Crawler) clearState() error {
 	if err := os.Remove(c.stateFile); err != nil && !os.IsNotExist(err) {
 		return err
@@ -199,7 +201,7 @@ func (c *Crawler) clearState() error {
 	return nil
 }
 
-// Crawl coordena o loop de coleta, salva progresso e respeita intervalos entre páginas.
+// Crawl executa o loop principal de navegação, respeitando o estado anterior e salvando o progresso página a página.
 func (c *Crawler) Crawl(ctx context.Context, startURL string) ([]Book, error) {
 	books, err := c.loadBooks()
 	if err != nil {
@@ -219,6 +221,7 @@ func (c *Crawler) Crawl(ctx context.Context, startURL string) ([]Book, error) {
 	for currentURL != "" {
 		log.Printf("coletando: %s", currentURL)
 
+		// Uso de context com timeout local para cada página individual.
 		pageCtx, cancel := context.WithTimeout(ctx, 25*time.Second)
 		doc, err := c.fetchPageWithRetry(pageCtx, currentURL)
 		cancel()
@@ -234,6 +237,7 @@ func (c *Crawler) Crawl(ctx context.Context, startURL string) ([]Book, error) {
 			return books, err
 		}
 
+		// Persistência imediata para evitar perda de dados se o processo for interrompido.
 		if err := c.saveBooks(books); err != nil {
 			return books, err
 		}
@@ -251,6 +255,7 @@ func (c *Crawler) Crawl(ctx context.Context, startURL string) ([]Book, error) {
 		default:
 		}
 
+		// Delay de cortesia para não sobrecarregar o servidor alvo.
 		time.Sleep(600 * time.Millisecond)
 		currentURL = nextPage
 	}
@@ -261,7 +266,7 @@ func (c *Crawler) Crawl(ctx context.Context, startURL string) ([]Book, error) {
 	return books, nil
 }
 
-// parseBooks extrai a lista de livros a partir da árvore HTML parseada.
+// parseBooks percorre a árvore HTML em busca de elementos 'article' que representam os produtos.
 func parseBooks(doc *html.Node) []Book {
 	var books []Book
 	var walk func(*html.Node)
@@ -277,7 +282,7 @@ func parseBooks(doc *html.Node) []Book {
 	return books
 }
 
-// extractBook coleta título, preço e avaliação de um bloco individual de livro.
+// extractBook isola a lógica de captura de atributos específicos de cada livro dentro do seu nó HTML.
 func extractBook(n *html.Node) Book {
 	var title, price, rating string
 	var walk func(*html.Node)
@@ -293,7 +298,7 @@ func extractBook(n *html.Node) Book {
 				}
 			case "a":
 				if title == "" {
-					title = getAttr(n, "title")
+					title = getAttr(n, "title") // O título completo geralmente está no atributo 'title'.
 				}
 			}
 		}
@@ -305,6 +310,7 @@ func extractBook(n *html.Node) Book {
 	return Book{Title: title, Price: price, Rating: rating}
 }
 
+// getRating extrai a classe de avaliação ignorando a classe base 'star-rating'.
 func getRating(n *html.Node) string {
 	for _, a := range n.Attr {
 		if a.Key == "class" {
@@ -318,6 +324,7 @@ func getRating(n *html.Node) string {
 	return ""
 }
 
+// resolveNextPage identifica o link da próxima página e resolve a URL relativa para absoluta.
 func resolveNextPage(doc *html.Node, currentURL string) (string, error) {
 	var nextHref string
 	var walk func(*html.Node)
@@ -349,6 +356,7 @@ func resolveNextPage(doc *html.Node, currentURL string) (string, error) {
 	return base.ResolveReference(rel).String(), nil
 }
 
+// hasClass verifica a presença de uma classe específica em um nó, lidando com múltiplas classes no mesmo atributo.
 func hasClass(n *html.Node, class string) bool {
 	for _, a := range n.Attr {
 		if a.Key == "class" {
@@ -362,6 +370,7 @@ func hasClass(n *html.Node, class string) bool {
 	return false
 }
 
+// getAttr recupera o valor de um atributo específico de um nó HTML.
 func getAttr(n *html.Node, key string) string {
 	for _, a := range n.Attr {
 		if a.Key == key {
