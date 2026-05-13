@@ -3,395 +3,424 @@ package main
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
+	"io"
 	"log"
-	"net"
+	"math"
 	"net/http"
-	"net/url"
 	"os"
+	"os/signal"
 	"strings"
+	"syscall"
 	"time"
 
 	"golang.org/x/net/html"
 )
 
-// Book define a estrutura de dados para o mapeamento do JSON de saída.
+// Book representa um livro extraído do site
 type Book struct {
 	Title  string `json:"title"`
 	Price  string `json:"price"`
 	Rating string `json:"rating"`
 }
 
-// Crawler centraliza as configurações de rede, políticas de repetição e persistência de estado.
+// CrawlResult encapsula o resultado da coleta
+type CrawlResult struct {
+	Books      []Book    `json:"books"`
+	TotalBooks int       `json:"total_books"`
+	StartTime  time.Time `json:"start_time"`
+	EndTime    time.Time `json:"end_time"`
+	Duration   string    `json:"duration"`
+}
+
+// CrawlerConfig contém configurações do crawler
+type CrawlerConfig struct {
+	BaseURL         string
+	StartPage       string
+	MaxRetries      int
+	InitialBackoff  time.Duration
+	RequestTimeout  time.Duration
+	RateLimitDelay  time.Duration
+	OutputFile      string
+	MaxBooksPerPage int
+}
+
+// Crawler executa a coleta de dados
 type Crawler struct {
-	client         *http.Client
-	maxRetries     int
-	initialBackoff time.Duration
-	userAgent      string
-	outputFile     string
-	stateFile      string
+	config    CrawlerConfig
+	client    *http.Client
+	books     []Book
+	startTime time.Time
 }
 
-// crawlState armazena a última URL processada para permitir a retomada após interrupções.
-type crawlState struct {
-	NextPage string `json:"next_page"`
-}
-
-// HTTPStatusError captura erros específicos de status HTTP para facilitar a lógica de retentativa.
-type HTTPStatusError struct {
-	URL        string
-	StatusCode int
-}
-
-func (e *HTTPStatusError) Error() string {
-	return fmt.Sprintf("status %d for %s", e.StatusCode, e.URL)
-}
-
-// NewCrawler configura o cliente HTTP com timeouts de segurança e define o User-Agent para evitar bloqueios.
-func NewCrawler(outputFile, stateFile string) *Crawler {
+// NewCrawler cria uma nova instância do crawler
+func NewCrawler(config CrawlerConfig) *Crawler {
 	return &Crawler{
+		config: config,
 		client: &http.Client{
-			Timeout: 20 * time.Second, // Timeout global para evitar conexões penduradas.
+			Timeout: config.RequestTimeout,
 		},
-		maxRetries:     3,
-		initialBackoff: 500 * time.Millisecond,
-		userAgent:      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
-		outputFile:     outputFile,
-		stateFile:      stateFile,
+		books:     make([]Book, 0),
+		startTime: time.Now(),
 	}
 }
 
-// fetchPage executa a chamada HTTP e realiza o parse do corpo da resposta para uma árvore HTML.
-func (c *Crawler) fetchPage(ctx context.Context, fullURL string) (*html.Node, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, fullURL, nil)
-	if err != nil {
-		return nil, err
-	}
-	req.Header.Set("User-Agent", c.userAgent)
-
-	resp, err := c.client.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("falha na requisição: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return nil, &HTTPStatusError{URL: fullURL, StatusCode: resp.StatusCode}
-	}
-
-	doc, err := html.Parse(resp.Body)
-	if err != nil {
-		return nil, fmt.Errorf("falha ao parsear HTML: %w", err)
-	}
-	return doc, nil
-}
-
-// fetchPageWithRetry gerencia falhas temporárias aplicando backoff exponencial entre as tentativas.
-func (c *Crawler) fetchPageWithRetry(ctx context.Context, fullURL string) (*html.Node, error) {
+// fetchPage faz requisição HTTP com retry e backoff exponencial
+func (c *Crawler) fetchPage(ctx context.Context, url string) (*html.Node, error) {
 	var lastErr error
-	backoff := c.initialBackoff
 
-	for attempt := 0; attempt <= c.maxRetries; attempt++ {
-		if attempt > 0 {
-			select {
-			case <-ctx.Done():
-				return nil, ctx.Err()
-			case <-time.After(backoff):
-			}
-			backoff *= 2 // Aumenta o tempo de espera a cada falha seguida.
-		}
-
-		doc, err := c.fetchPage(ctx, fullURL)
-		if err == nil {
-			return doc, nil
-		}
-
-		lastErr = err
-		if !isRetryable(err) { // Interrompe se o erro for definitivo (ex: 404).
-			return nil, err
-		}
-
-		log.Printf("tentativa %d falhou para %s: %v", attempt+1, fullURL, err)
-	}
-
-	return nil, fmt.Errorf("não foi possível buscar %s após %d tentativas: %w", fullURL, c.maxRetries+1, lastErr)
-}
-
-// isRetryable identifica erros de rede ou status 429/5xx que justificam uma nova tentativa.
-func isRetryable(err error) bool {
-	var httpErr *HTTPStatusError
-	if errors.As(err, &httpErr) {
-		return httpErr.StatusCode == http.StatusTooManyRequests || httpErr.StatusCode >= 500
-	}
-
-	var netErr net.Error
-	if errors.As(err, &netErr) {
-		return netErr.Timeout() || netErr.Temporary()
-	}
-
-	if errors.Is(err, context.DeadlineExceeded) {
-		return true
-	}
-
-	return false
-}
-
-// loadBooks carrega dados existentes do disco para garantir a continuidade da lista de resultados.
-func (c *Crawler) loadBooks() ([]Book, error) {
-	data, err := os.ReadFile(c.outputFile)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return nil, nil
-		}
-		return nil, err
-	}
-
-	var books []Book
-	if err := json.Unmarshal(data, &books); err != nil {
-		return nil, fmt.Errorf("falha ao ler saída existente: %w", err)
-	}
-	return books, nil
-}
-
-// saveJSON realiza a escrita atômica utilizando um arquivo temporário para evitar corrupção de dados.
-func (c *Crawler) saveJSON(filename string, v interface{}) error {
-	data, err := json.MarshalIndent(v, "", "  ")
-	if err != nil {
-		return err
-	}
-
-	tmp := filename + ".tmp"
-	if err := os.WriteFile(tmp, data, 0o644); err != nil {
-		return err
-	}
-	if err := os.Remove(filename); err != nil && !os.IsNotExist(err) {
-		return err
-	}
-	return os.Rename(tmp, filename)
-}
-
-func (c *Crawler) saveState(state crawlState) error {
-	return c.saveJSON(c.stateFile, state)
-}
-
-func (c *Crawler) saveBooks(books []Book) error {
-	return c.saveJSON(c.outputFile, books)
-}
-
-func (c *Crawler) loadState() (crawlState, error) {
-	var state crawlState
-	data, err := os.ReadFile(c.stateFile)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return state, nil
-		}
-		return state, err
-	}
-	if err := json.Unmarshal(data, &state); err != nil {
-		return state, fmt.Errorf("falha ao ler estado de crawl: %w", err)
-	}
-	return state, nil
-}
-
-func (c *Crawler) clearState() error {
-	if err := os.Remove(c.stateFile); err != nil && !os.IsNotExist(err) {
-		return err
-	}
-	return nil
-}
-
-// Crawl executa o loop principal de navegação, respeitando o estado anterior e salvando o progresso página a página.
-func (c *Crawler) Crawl(ctx context.Context, startURL string) ([]Book, error) {
-	books, err := c.loadBooks()
-	if err != nil {
-		return nil, err
-	}
-
-	state, err := c.loadState()
-	if err != nil {
-		return books, err
-	}
-
-	currentURL := startURL
-	if state.NextPage != "" {
-		currentURL = state.NextPage
-	}
-
-	for currentURL != "" {
-		log.Printf("coletando: %s", currentURL)
-
-		// Uso de context com timeout local para cada página individual.
-		pageCtx, cancel := context.WithTimeout(ctx, 25*time.Second)
-		doc, err := c.fetchPageWithRetry(pageCtx, currentURL)
-		cancel()
-		if err != nil {
-			return books, err
-		}
-
-		pageBooks := parseBooks(doc)
-		books = append(books, pageBooks...)
-
-		nextPage, err := resolveNextPage(doc, currentURL)
-		if err != nil {
-			return books, err
-		}
-
-		// Persistência imediata para evitar perda de dados se o processo for interrompido.
-		if err := c.saveBooks(books); err != nil {
-			return books, err
-		}
-		if err := c.saveState(crawlState{NextPage: nextPage}); err != nil {
-			return books, err
-		}
-
-		if nextPage == "" {
-			break
-		}
-
+	for attempt := 0; attempt < c.config.MaxRetries; attempt++ {
 		select {
 		case <-ctx.Done():
-			return books, ctx.Err()
+			return nil, ctx.Err()
 		default:
 		}
 
-		// Delay de cortesia para não sobrecarregar o servidor alvo.
-		time.Sleep(600 * time.Millisecond)
-		currentURL = nextPage
+		node, err := c.fetchPageOnce(ctx, url)
+		if err == nil {
+			return node, nil
+		}
+
+		lastErr = err
+
+		// Não faz retry para certos erros
+		if isNonRetryableError(err) {
+			log.Printf("Erro não recuperável em %s: %v", url, err)
+			return nil, err
+		}
+
+		if attempt < c.config.MaxRetries-1 {
+			backoff := time.Duration(math.Pow(2, float64(attempt))) * c.config.InitialBackoff
+			log.Printf("Tentativa %d falhou para %s. Aguardando %v antes de retry...", attempt+1, url, backoff)
+			time.Sleep(backoff)
+		}
 	}
 
-	if err := c.clearState(); err != nil {
-		return books, err
-	}
-	return books, nil
+	return nil, fmt.Errorf("falha após %d tentativas: %w", c.config.MaxRetries, lastErr)
 }
 
-// parseBooks percorre a árvore HTML em busca de elementos 'article' que representam os produtos.
-func parseBooks(doc *html.Node) []Book {
-	var books []Book
+// fetchPageOnce faz uma única requisição
+func (c *Crawler) fetchPageOnce(ctx context.Context, url string) (*html.Node, error) {
+	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
+	if err != nil {
+		return nil, fmt.Errorf("erro ao criar requisição: %w", err)
+	}
+
+	// Adiciona User-Agent para evitar bloqueios
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
+	req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
+	req.Header.Set("Accept-Language", "en-US,en;q=0.5")
+
+	resp, err := c.client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("erro na requisição HTTP: %w", err)
+	}
+	defer resp.Body.Close()
+
+	// Valida status code
+	if resp.StatusCode != http.StatusOK {
+		// 429 e 503 são retentáveis
+		if resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode == http.StatusServiceUnavailable {
+			return nil, fmt.Errorf("rate limit/server unavailable: %d", resp.StatusCode)
+		}
+		// 404, 410, 403 não são retentáveis
+		if resp.StatusCode == http.StatusNotFound || resp.StatusCode == http.StatusGone || resp.StatusCode == http.StatusForbidden {
+			return nil, fmt.Errorf("erro HTTP não recuperável: %d", resp.StatusCode)
+		}
+		return nil, fmt.Errorf("erro HTTP: %d", resp.StatusCode)
+	}
+
+	// Limita tamanho da resposta para evitar OOM
+	limitedReader := io.LimitReader(resp.Body, 10*1024*1024) // 10MB max
+	body, err := io.ReadAll(limitedReader)
+	if err != nil {
+		return nil, fmt.Errorf("erro ao ler body: %w", err)
+	}
+
+	if len(body) == 0 {
+		return nil, fmt.Errorf("resposta vazia")
+	}
+
+	doc, err := html.Parse(strings.NewReader(string(body)))
+	if err != nil {
+		return nil, fmt.Errorf("erro ao fazer parse do HTML: %w", err)
+	}
+
+	return doc, nil
+}
+
+// isNonRetryableError determina se um erro não deve ser retentado
+func isNonRetryableError(err error) bool {
+	errStr := err.Error()
+	return strings.Contains(errStr, "não recuperável") ||
+		strings.Contains(errStr, "resposta vazia") ||
+		strings.Contains(errStr, "parse")
+}
+
+// parseBooks extrai livros da página
+func (c *Crawler) parseBooks(doc *html.Node) {
 	var walk func(*html.Node)
 	walk = func(n *html.Node) {
-		if n.Type == html.ElementNode && n.Data == "article" && hasClass(n, "product_pod") {
-			books = append(books, extractBook(n))
+		if n.Type == html.ElementNode && hasClass(n, "product_pod") {
+			if len(c.books) < c.config.MaxBooksPerPage {
+				book := c.extractBook(n)
+				// Valida se o livro tem dados importantes
+				if book.Title != "" && book.Price != "" {
+					c.books = append(c.books, book)
+				}
+			}
 		}
-		for c := n.FirstChild; c != nil; c = c.NextSibling {
-			walk(c)
+		for child := n.FirstChild; child != nil; child = child.NextSibling {
+			walk(child)
 		}
 	}
 	walk(doc)
-	return books
 }
 
-// extractBook isola a lógica de captura de atributos específicos de cada livro dentro do seu nó HTML.
-func extractBook(n *html.Node) Book {
+// extractBook extrai informações de um livro individual
+func (c *Crawler) extractBook(n *html.Node) Book {
 	var title, price, rating string
+
 	var walk func(*html.Node)
 	walk = func(n *html.Node) {
 		if n.Type == html.ElementNode {
 			switch n.Data {
+			case "h3":
+				// Extrai título do link dentro de h3
+				if link := findElement(n, "a"); link != nil {
+					title = getAttr(link, "title")
+				}
 			case "p":
 				if hasClass(n, "star-rating") {
-					rating = getRating(n)
+					rating = extractRating(n)
 				}
-				if hasClass(n, "price_color") && n.FirstChild != nil {
-					price = strings.TrimSpace(n.FirstChild.Data)
-				}
-			case "a":
-				if title == "" {
-					title = getAttr(n, "title") // O título completo geralmente está no atributo 'title'.
+				if hasClass(n, "price_color") {
+					price = extractPrice(n)
 				}
 			}
 		}
-		for c := n.FirstChild; c != nil; c = c.NextSibling {
-			walk(c)
+		for child := n.FirstChild; child != nil; child = child.NextSibling {
+			walk(child)
 		}
 	}
 	walk(n)
-	return Book{Title: title, Price: price, Rating: rating}
+
+	return Book{
+		Title:  strings.TrimSpace(title),
+		Price:  strings.TrimSpace(price),
+		Rating: strings.TrimSpace(rating),
+	}
 }
 
-// getRating extrai a classe de avaliação ignorando a classe base 'star-rating'.
-func getRating(n *html.Node) string {
-	for _, a := range n.Attr {
-		if a.Key == "class" {
-			for _, token := range strings.Fields(a.Val) {
-				if token != "star-rating" {
-					return token
-				}
-			}
-		}
+// extractRating extrai a classificação de estrelas
+func extractRating(n *html.Node) string {
+	classAttr := getAttr(n, "class")
+	if classAttr == "" {
+		return ""
+	}
+	parts := strings.Fields(classAttr)
+	if len(parts) >= 2 {
+		return parts[1]
 	}
 	return ""
 }
 
-// resolveNextPage identifica o link da próxima página e resolve a URL relativa para absoluta.
-func resolveNextPage(doc *html.Node, currentURL string) (string, error) {
-	var nextHref string
+// extractPrice extrai o preço do elemento
+func extractPrice(n *html.Node) string {
+	if n.FirstChild != nil && n.FirstChild.Type == html.TextNode {
+		return n.FirstChild.Data
+	}
+	return ""
+}
+
+// findElement procura por um elemento específico
+func findElement(n *html.Node, tag string) *html.Node {
+	var result *html.Node
 	var walk func(*html.Node)
-	walk = func(n *html.Node) {
-		if n.Type == html.ElementNode && n.Data == "li" && hasClass(n, "next") {
-			for c := n.FirstChild; c != nil; c = c.NextSibling {
-				if c.Type == html.ElementNode && c.Data == "a" {
-					nextHref = getAttr(c, "href")
-				}
+	walk = func(node *html.Node) {
+		if result != nil {
+			return
+		}
+		if node.Type == html.ElementNode && node.Data == tag {
+			result = node
+			return
+		}
+		for child := node.FirstChild; child != nil; child = child.NextSibling {
+			walk(child)
+			if result != nil {
+				return
 			}
 		}
-		for c := n.FirstChild; c != nil; c = c.NextSibling {
-			walk(c)
+	}
+	walk(n)
+	return result
+}
+
+// getNextPage encontra o link da próxima página
+func (c *Crawler) getNextPage(doc *html.Node) string {
+	var next string
+	var walk func(*html.Node)
+	walk = func(n *html.Node) {
+		if next != "" {
+			return
+		}
+
+		if n.Type == html.ElementNode && n.Data == "li" && hasClass(n, "next") {
+			if a := findElement(n, "a"); a != nil {
+				next = getAttr(a, "href")
+			}
+		}
+
+		for child := n.FirstChild; child != nil; child = child.NextSibling {
+			walk(child)
 		}
 	}
 	walk(doc)
-	if nextHref == "" {
-		return "", nil
-	}
-
-	base, err := url.Parse(currentURL)
-	if err != nil {
-		return "", fmt.Errorf("URL inválida %s: %w", currentURL, err)
-	}
-	rel, err := url.Parse(nextHref)
-	if err != nil {
-		return "", fmt.Errorf("href inválido %s: %w", nextHref, err)
-	}
-	return base.ResolveReference(rel).String(), nil
+	return next
 }
 
-// hasClass verifica a presença de uma classe específica em um nó, lidando com múltiplas classes no mesmo atributo.
+// hasClass verifica se um elemento tem uma classe
 func hasClass(n *html.Node, class string) bool {
-	for _, a := range n.Attr {
-		if a.Key == "class" {
-			for _, token := range strings.Fields(a.Val) {
-				if token == class {
-					return true
-				}
-			}
-		}
-	}
-	return false
+	return strings.Contains(getAttr(n, "class"), class)
 }
 
-// getAttr recupera o valor de um atributo específico de um nó HTML.
+// getAttr obtém um atributo de um elemento
 func getAttr(n *html.Node, key string) string {
-	for _, a := range n.Attr {
-		if a.Key == key {
-			return a.Val
+	for _, attr := range n.Attr {
+		if attr.Key == key {
+			return attr.Val
 		}
 	}
 	return ""
 }
 
-func main() {
-	ctx := context.Background()
-	crawler := NewCrawler("books.json", "crawler_state.json")
-	startURL := "http://books.toscrape.com/index.html"
+// Run executa o crawler
+func (c *Crawler) Run(ctx context.Context) error {
+	baseURL := c.config.BaseURL
+	page := c.config.StartPage
 
-	books, err := crawler.Crawl(ctx, startURL)
-	if err != nil {
-		log.Fatalf("crawler falhou: %v", err)
+	pageCount := 0
+
+	for page != "" {
+		select {
+		case <-ctx.Done():
+			log.Println("Crawling cancelado.")
+			return ctx.Err()
+		default:
+		}
+
+		pageCount++
+		url := baseURL + page
+		log.Printf("Coletando página %d: %s", pageCount, page)
+
+		doc, err := c.fetchPage(ctx, url)
+		if err != nil {
+			log.Printf("Erro ao buscar %s: %v", url, err)
+			break
+		}
+
+		beforeCount := len(c.books)
+		c.parseBooks(doc)
+		log.Printf("  Livros encontrados nesta página: %d (total: %d)", len(c.books)-beforeCount, len(c.books))
+
+		next := c.getNextPage(doc)
+		page = next
+
+		// Rate limiting - aguarda entre requisições
+		if page != "" {
+			time.Sleep(c.config.RateLimitDelay)
+		}
 	}
 
-	log.Printf("total de livros coletados: %d", len(books))
-	for _, book := range books {
-		fmt.Printf("Título: %-60s | Preço: %-10s | Avaliação: %s\n", book.Title, book.Price, book.Rating)
+	return nil
+}
+
+// SaveResults salva os resultados em arquivo JSON
+func (c *Crawler) SaveResults() error {
+	result := CrawlResult{
+		Books:      c.books,
+		TotalBooks: len(c.books),
+		StartTime:  c.startTime,
+		EndTime:    time.Now(),
+		Duration:   time.Since(c.startTime).String(),
+	}
+
+	data, err := json.MarshalIndent(result, "", "  ")
+	if err != nil {
+		return fmt.Errorf("erro ao serializar JSON: %w", err)
+	}
+
+	err = os.WriteFile(c.config.OutputFile, data, 0644)
+	if err != nil {
+		return fmt.Errorf("erro ao salvar arquivo: %w", err)
+	}
+
+	log.Printf("Resultados salvos em %s", c.config.OutputFile)
+	return nil
+}
+
+// PrintResults imprime um resumo dos resultados
+func (c *Crawler) PrintResults() {
+	fmt.Println("\n" + strings.Repeat("=", 80))
+	fmt.Printf("RESUMO DA COLETA\n")
+	fmt.Println(strings.Repeat("=", 80))
+	fmt.Printf("Total de livros coletados: %d\n", len(c.books))
+	fmt.Printf("Tempo de execução: %v\n", time.Since(c.startTime))
+	fmt.Println(strings.Repeat("=", 80))
+
+	if len(c.books) > 0 {
+		fmt.Println("\nPrimeiros 10 livros:")
+		limit := len(c.books)
+		if limit > 10 {
+			limit = 10
+		}
+		for i := 0; i < limit; i++ {
+			b := c.books[i]
+			fmt.Printf("[%d] Título: %s | Preço: %s | Avaliação: %s\n",
+				i+1, b.Title, b.Price, b.Rating)
+		}
+	}
+}
+
+func main() {
+	// Configuração do crawler
+	config := CrawlerConfig{
+		BaseURL:         "http://books.toscrape.com/catalogue/",
+		StartPage:       "page-1.html",
+		MaxRetries:      3,
+		InitialBackoff:  1 * time.Second,
+		RequestTimeout:  10 * time.Second,
+		RateLimitDelay:  500 * time.Millisecond,
+		OutputFile:      "books_results.json",
+		MaxBooksPerPage: 10000, // Limite de segurança
+	}
+
+	crawler := NewCrawler(config)
+
+	// Configura context com timeout e signal handling
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+
+	// Configura signal handler para graceful shutdown
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
+
+	go func() {
+		<-sigChan
+		log.Println("Sinal de interrupção recebido. Finalizando...")
+		cancel()
+	}()
+
+	// Executa o crawler
+	log.Println("Iniciando coleta de livros...")
+	if err := crawler.Run(ctx); err != nil && err != context.Canceled {
+		log.Printf("Erro durante execução: %v", err)
+	}
+
+	// Salva e exibe resultados
+	crawler.PrintResults()
+
+	if err := crawler.SaveResults(); err != nil {
+		log.Printf("Erro ao salvar resultados: %v", err)
 	}
 }
